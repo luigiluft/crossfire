@@ -14,6 +14,15 @@
   Cross-vendor adversarial review <i>and</i> mixture-of-agents — in one zero-dependency CLI.
 </p>
 
+---
+
+**What** · a tiny CLI that runs a cross-vendor LLM ensemble over your plans, diffs, and code.<br>
+**Why** · an AI that reviews its own work shares its own blind spots, so crossfire borrows a model from a *different lab* to catch what yours rationalized past.<br>
+**Proof** · in one run, two models from different vendors independently flagged a billing bypass a human had shipped past. ([see it ↓](#see-it-work))<br>
+**Try** · `npx github:luigiluft/crossfire review plan.md --type plan`
+
+---
+
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
   <a href="#review-adversarial-catch">Review</a> ·
