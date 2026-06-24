@@ -1,0 +1,47 @@
+{
+  "name": "crossfire",
+  "version": "0.1.0",
+  "description": "Cross-vendor LLM ensemble for AI coding agents: adversarial review (catch) + mixture-of-agents (generate). Zero dependencies, one OpenRouter key.",
+  "type": "module",
+  "bin": {
+    "crossfire": "bin/crossfire.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "review": "node cross-review.mjs",
+    "fuse": "node fusion.mjs",
+    "check": "node cross-review.mjs --check"
+  },
+  "files": [
+    "bin",
+    "cross-review.mjs",
+    "fusion.mjs",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "llm",
+    "code-review",
+    "adversarial-review",
+    "mixture-of-agents",
+    "moa",
+    "openrouter",
+    "ai-agents",
+    "claude-code",
+    "cursor",
+    "cli"
+  ],
+  "author": "luigiluft (https://github.com/luigiluft)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luigiluft/crossfire.git"
+  },
+  "homepage": "https://github.com/luigiluft/crossfire#readme",
+  "bugs": {
+    "url": "https://github.com/luigiluft/crossfire/issues"
+  }
+}

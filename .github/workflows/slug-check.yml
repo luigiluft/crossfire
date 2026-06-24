@@ -1,0 +1,29 @@
+name: slug-check
+
+# OpenRouter retires model slugs silently. This validates that the default slugs
+# crossfire ships with are still served, so an automated run never fails silently.
+# Requires an OPENROUTER_API_KEY repo secret. Without it, the job reports and stops.
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate model slugs are live on OpenRouter
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "::warning::OPENROUTER_API_KEY secret not set — skipping live slug check."
+            exit 0
+          fi
+          node cross-review.mjs --check
+          node fusion.mjs --check

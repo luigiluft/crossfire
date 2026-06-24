@@ -1,0 +1,305 @@
+
+════ CROSSFIRE · review · PANEL (4 blind reviewers + judge) ════
+
+┌─ reviewer 1: z-ai/glm-5.2  ·  FIX-BEFORE-SHIP
+│ ## Findings
+│ 
+│ ### 1. No webhook signature verification — forged credit grants
+│ **Priority: CRITICAL**
+│ **Confidence: 5**
+│ 
+│ The plan states the endpoint is public and "we trust the payload, since it comes from Stripe." This is the core defect. A public endpoint with no signature verification means anyone can POST a forged payload with arbitrary `amount_total` and `user_id` metadata and grant themselves unlimited credits.
+│ 
+│ **Trigger:** `curl -X POST https://app.example.com/api/webhook -d '{"amount_total": 999999, "metadata": {"user_id": "attacker-account"}}'` — returns 200, balance incremented. No Stripe involvement required.
+│ 
+│ The plan must specify verification of the `Stripe-Signature` header using `stripe.webhooks.constructEvent(rawBody, sig, endpointSecret)` before reading any field. This also requires the raw body (not parsed JSON), which constrains the framework middleware ordering — currently unspecified.
+│ 
+│ ---
+│ 
+│ ### 2. No idempotency — Stripe retries double-credit the account
+│ **Priority: CRITICAL**
+│ **Confidence: 5**
+│ 
+│ Stripe retries webhooks on any non-2xx, and also redelivers on request. The handler does a blind `UPDATE balance = balance + :amount` with no deduplication. Every successful retry adds the amount again.
+│ 
+│ **Trigger:** Stripe delivers event `evt_123`, handler returns 200 but the connection drops / Stripe doesn't receive the 200 in time → Stripe redelivers `evt_123` → balance incremented twice. Also triggered by any transient handler error (DB timeout) where the UPDATE committed but the response didn't reach Stripe.
+│ 
+│ The plan must store processed `event.id` (or `session.id`) in a unique column / dedup table and skip already-seen events. The dedup check + balance update must be atomic (transaction + unique constraint), otherwise the race between two concurrent deliveries still double-credits.
+│ 
+│ ---
+│ 
+│ ### 3. No row-level concurrency control on the balance update
+│ **Priority: HIGH**
+│ **Confidence: 4**
+│ 
+│ `UPDATE accounts SET balance = balance + :amount WHERE id = :user_id` is atomic at the statement level, but the plan has no guard against two different events (a legitimate second purchase, or a retry racing the dedup insert) both applying. Combined with finding #2's missing dedup, concurrent in-flight deliveries of the same event will both pass any check-then-insert that isn't constrained.
+│ 
+│ **Trigger:** Two Stripe redeliveries of `evt_123` arrive within the same millisecond (Stripe can deliver in parallel across regions). Both pass a naive `if not exists(event_id)` check, both UPDATE, balance doubled.
+│ 
+│ The fix is a unique constraint on the processed-event id and `INSERT ... ON CONFLICT DO NOTHING` returning whether a row was inserted, only applying the credit if the insert succeeded — all in one transaction.
+│ 
+│ ---
+│ 
+│ ### 4. `user_id` from session metadata is trusted without validation
+│ **Priority: HIGH**
+│ **Confidence: 4**
+│ 
+│ Even with signature verification, the plan reads `user_id` from `session.metadata` and applies it directly. Metadata is set by the client at checkout-session creation time. If the checkout session is created client-side (common pattern), an attacker can set `metadata.user_id` to any account and have a real paying customer's purchase credit the attacker's balance — or more subtly, set it to a non-existent / wrong UUID.
+│ 
+│ **Trigger:** Attacker creates their own Stripe Checkout Session (if the client is allowed to) with `metadata.user_id = "victim-uuid"`, pays $1, victim gets... actually attacker gets credited. Or `user_id` is a malformed UUID → `UPDATE ... WHERE id = :user_id` silently matches zero rows, returns 200, purchase is lost with no error.
+│ 
+│ The plan must specify: (a) who creates the checkout session and whether `user_id` is server-set and tamper-proof, (b) behavior when `UPDATE` affects 0 rows (currently a silent success → 200 OK → Stripe won't retry → credits vanish).
+│ 
+│ ---
+│ 
+│ ### 5. Silent failure on zero-row update / missing account
+│ **Priority: HIGH**
+│ **Confidence: 4**
+│ 
+│ Step 4 returns `200 OK` unconditionally. If `user_id` is null (metadata missing), malformed, or points to a deleted account, the `UPDATE` affects 0 rows, the handler still returns 200, and the purchase is silently lost. Stripe will not retry because it got a 2xx.
+│ 
+│ **Trigger:** Webhook for a session whose metadata lacks `user_id` (e.g., a session created by support, or a guest checkout) → `:user_id` is NULL → `UPDATE accounts SET balance = balance + :amount WHERE id = NULL` matches nothing → 200 OK → money taken, no credit granted, no alert.
+│ 
+│ The plan must specify checking `rowcount` and returning non-2xx (or at least logging/alerting) when 0 rows affected, and explicit handling of missing metadata.
+│ 
+│ ---
+│ 
+│ ### 6. `amount_total` unit confusion (cents vs dollars)
+│ **Priority: MEDIUM**
+│ **Confidence: 3**
+│ 
+│ `session.amount_total` is in the smallest currency unit (cents for USD). The plan passes it straight into `balance + :amount`. If `balance` is stored in credits (not cents) or in dollars, this is a 100x or fractional error. The plan never specifies the unit of `balance` or the mapping from `amount_total` to credit count.
+│ 
+│ **Trigger:** A $10 purchase → `amount_total = 1000` → if balance is in credit-units where 1 credit = $1, user gets 1000 credits instead of 10. Or if the plan intends "credits = dollars," the integer-division / unit is unspecified.
+│ 
+│ The plan must define the conversion: `credits = amount_total / 100 * price_per_dollar` or similar, and specify rounding behavior.
+│ 
+│ ---
+│ 
+│ ### 7. No currency / refund / dispute handling
+│ **Priority: MEDIUM**
+│ **Confidence: 3**
+│ 
+│ The plan only handles `checkout.session.completed`. It doesn't specify behavior for `charge.refunded`, `charge.dispute.created`, or partial refunds. Credits granted on a later-refunded purchase remain on the account.
+│ 
+│ **Trigger:** Customer buys credits, receives them, requests a refund → Stripe processes refund → no webhook handler → credits stay, user has been refunded but keeps credits.
+│ 
+│ ---
+│ 
+│ ### 8. Staging/production shared handler with no environment isolation
+│ **Priority: MEDIUM**
+│ **Confidence: 3**
+│ 
+│ "The same handler is used in staging and production." Combined with the missing signature verification and the shared-dedup-table assumption, staging test events and production events can collide on `event.id` namespaces (they won't — Stripe event IDs are globally unique per account, but staging and prod are different Stripe accounts, so `evt_123` could exist in both). More importantly, if the same DB is ever shared or the same endpoint secret is reused across envs, staging traffic can affect prod balances.
+│ 
+│ **Trigger:** Staging webhook with a test `user_id` that happens to match a prod UUID (e.g., copied from a prod dump) → if any config drift points staging at prod DB, credits applied to prod account. The plan doesn't specify environment isolation of the endpoint secret or DB.
+│ 
+│ ---
+│ 
+│ ## Highest-leverage fix
+│ Add Stripe webhook signature verification on the raw request body before any field is read. Without it, every other fix is theater — the endpoint is a public money-printer. Confidence it's real: 5.
+│ 
+│ VERDICT: FIX-BEFORE-SHIP
+
+┌─ reviewer 2: moonshotai/kimi-k2.6  ·  FIX-BEFORE-SHIP
+│ - **CRITICAL** [Notes: “We trust the payload, since it comes from Stripe.” + Step 1]: Public endpoint accepts forged webhooks with no signature verification. An attacker can POST a self-crafted JSON body containing `data.object.amount_total` and `data.object.metadata.user_id` to `/api/webhook` and grant arbitrary credits. Trigger: any HTTP POST to the public endpoint with a syntactically valid payload. Confidence: 5.
+│ 
+│ - **CRITICAL** [Steps 2–4]: No idempotency check. Stripe retries the same `checkout.session.completed` event if the network times out before the 200 ACK reaches Stripe. The handler runs `UPDATE … balance + :amount` again for the same purchase, double- (or n-) crediting the user. Trigger: Stripe retry of an identical event for the same checkout session ID. Confidence: 5.
+│ 
+│ - **CRITICAL** [Step 4: “It returns 200 OK”]: Unconditional 200 OK with no verification that the UPDATE modified a row. If `user_id` in session metadata references a deleted/non-existent account, the UPDATE affects 0 rows, yet the handler returns 200. Stripe marks the event delivered and never retries; the customer is charged but receives no credits. Trigger: `user_id` set to a non-existent or deleted account ID in session metadata. Confidence: 5.
+│ 
+│ - **CRITICAL** [Step 1–2]: No verification of the Stripe event `type`. If the endpoint is configured to receive multiple event types (standard in Stripe dashboards), events such as `charge.refunded` or `checkout.session.expired` that happen to carry `amount_total` and `metadata` fields will be processed as credit grants. Trigger: Stripe sends any event type other than `checkout.session.completed` to the endpoint. Confidence: 4.
+│ 
+│ - **HIGH** [Step 2: `session.amount_total`]: Unit mismatch. Stripe returns `amount_total` in the smallest currency unit (e.g., cents for USD). If the `balance` column stores credits in whole dollars/units, a $10.00 purchase (`amount_total = 1000`) adds 1000 credits instead of 10. Trigger: any successful checkout with a non-zero `amount_total` value from Stripe. Confidence: 4.
+│ 
+│ - **HIGH** [Step 2–3]: `checkout.session.completed` does not guarantee funds are captured. For delayed payment methods (ACH, SEPA Direct Debit, some BNPL), this event fires before the payment settles. If the payment later fails, the credits remain granted. Trigger: checkout session using `us_bank_account`, `sepa_debit`, or similar delayed-settlement payment method. Confidence: 4.
+│ 
+│ - **HIGH** [Step 3]: Direct balance mutation with no transaction ledger/audit log. There is no record linking the Stripe session ID to the credit grant. On double-credit bugs, reconciliation, or user disputes, the state is unrecoverable and idempotency cannot be enforced. Trigger: any credit top-up; failure manifests when attempting to reconcile account history or debug missing credits. Confidence: 4.
+│ 
+│ - **MEDIUM** [Notes: “The same handler is used in staging and production”]: Without environment-specific webhook signature verification, there is no guard against staging/test Stripe events hitting the production database (or vice versa) if webhook URLs are misconfigured. Trigger: Stripe test-mode event or staging deployment configured with a production-facing webhook URL. Confidence: 3.
+│ 
+│ **Highest-leverage fix first:** Add cryptographic signature verification on the public webhook endpoint before parsing any payload. This is the root guard: without it, an attacker bypasses all downstream logic entirely. Confidence: 5.
+│ 
+│ VERDICT: FIX-BEFORE-SHIP
+
+┌─ reviewer 3: openai/gpt-5.5  ·  FIX-BEFORE-SHIP
+│ ## Findings
+│ 
+│ ### CRITICAL — Public webhook trusts unsigned payloads, allowing arbitrary credit grants  
+│ **Section:** Notes: “The webhook endpoint is public” + “We trust the payload, since it comes from Stripe.”  
+│ **Failure mode:** Anyone can POST a fake `checkout.session.completed` payload to `/api/webhook` with arbitrary `metadata.user_id` and `amount_total`, causing unauthorized balance increases.  
+│ **Triggering input/condition:** An attacker sends:
+│ 
+│ ```json
+│ {
+│   "type": "checkout.session.completed",
+│   "data": {
+│     "object": {
+│       "amount_total": 100000000,
+│       "metadata": { "user_id": "victim_or_attacker_account_id" }
+│     }
+│   }
+│ }
+│ ```
+│ 
+│ The plan performs:
+│ 
+│ ```sql
+│ UPDATE accounts SET balance = balance + 100000000 WHERE id = ...
+│ ```
+│ 
+│ No Stripe signature verification, no event retrieval from Stripe, no origin authentication.  
+│ **Confidence:** 5
+│ 
+│ ---
+│ 
+│ ### CRITICAL — No idempotency; Stripe retries or duplicated events double-credit accounts  
+│ **Section:** Steps 1–4, especially Step 3: `UPDATE accounts SET balance = balance + :amount WHERE id = :user_id`, then Step 4 returns `200 OK`.  
+│ **Failure mode:** Stripe webhooks are at-least-once delivery. The same `checkout.session.completed` event can be delivered multiple times due to retries, network timeout, handler crash after DB update but before Stripe receives `200`, manual replay, or duplicate delivery. Each delivery increments balance again.  
+│ **Triggering input/condition:** Stripe sends event `evt_123` for a $20 purchase. Handler updates balance by 2000 but times out before returning `200`. Stripe retries `evt_123`; handler updates balance by another 2000. User receives double credits for one payment.  
+│ **Confidence:** 5
+│ 
+│ ---
+│ 
+│ ### HIGH — Credits may be granted before payment is actually paid for asynchronous payment methods  
+│ **Section:** Step 1: only listens to `checkout.session.completed`; Step 2–3 immediately credit `amount_total`.  
+│ **Failure mode:** `checkout.session.completed` means the Checkout Session completed, not necessarily that funds are settled/paid for all payment methods. For asynchronous methods, the session can complete while `payment_status` is `unpaid`, with final success/failure arriving later via events such as async payment succeeded/failed or payment intent events. The plan credits immediately and never reverses on failure.  
+│ **Triggering input/condition:** User chooses an async payment method, completes Checkout, webhook `checkout.session.completed` arrives with `payment_status: "unpaid"`. Handler credits account. Later payment fails; balance remains credited.  
+│ **Confidence:** 4
+│ 
+│ ---
+│ 
+│ ### HIGH — Same handler for staging and production can cross-credit environments  
+│ **Section:** Notes: “The same handler is used in staging and production.”  
+│ **Failure mode:** The plan does not require checking Stripe `livemode`, account ID, webhook signing secret per environment, or routing events to the matching database. Test-mode or staging events can credit production accounts if sent to the production endpoint, especially because the payload is trusted.  
+│ **Triggering input/condition:** A test-mode Checkout Session from staging has `metadata.user_id` equal to a real production account UUID. The event is sent/replayed to the production `/api/webhook`. Production handler credits that production account.  
+│ **Confidence:** 4
+│ 
+│ ---
+│ 
+│ ### HIGH — Uses `amount_total` as credit amount without defining units or product mapping  
+│ **Section:** Step 2: “handler reads `session.amount_total`” and Step 3 adds it directly to `balance`.  
+│ **Failure mode:** Stripe `amount_total` is in the currency’s smallest unit, not necessarily “credits.” If `accounts.balance` stores credits or dollars, direct addition corrupts balances. It may also include taxes, discounts, shipping, currency conversion assumptions, or non-credit line items depending on Checkout configuration.  
+│ **Triggering input/condition:** User buys a “100 credits for $10.00 USD” package. Stripe sends `amount_total = 1000`. Handler adds `1000` to balance instead of `100`. Or if balance is dollars, it adds `1000` instead of `10.00`.  
+│ **Confidence:** 4
+│ 
+│ ---
+│ 
+│ ### HIGH — No validation that the Checkout Session corresponds to an allowed credit purchase  
+│ **Section:** Step 2 trusts `session.amount_total` and `user_id` from metadata.  
+│ **Failure mode:** The plan does not verify the session’s line items, price IDs, mode, currency, payment status, or that the purchased SKU maps to a known credit package. If the same webhook receives other Checkout Sessions, or a manipulated/incorrect session metadata setup exists, non-credit purchases can grant account credits.  
+│ **Triggering input/condition:** A user checks out for a $5 non-credit product using the same Stripe account and metadata includes `user_id`. The webhook sees `checkout.session.completed`, reads `amount_total = 500`, and credits 500 units.  
+│ **Confidence:** 4
+│ 
+│ ---
+│ 
+│ ### HIGH — Metadata `user_id` is treated as authoritative account ownership  
+│ **Section:** Step 2: “reads ... `user_id` from the session metadata.”  
+│ **Failure mode:** The plan does not require that the Checkout Session was created server-side for the authenticated user, nor that the Stripe customer/payment belongs to that user. If a client can influence metadata during Checkout Session creation, a buyer can credit any account ID.  
+│ **Triggering input/condition:** Attacker starts a Checkout Session and sets `metadata.user_id` to another account’s ID, or tampers with a server endpoint that accepts user-supplied metadata. Payment completion credits the chosen account.  
+│ **Confidence:** 3
+│ 
+│ ---
+│ 
+│ ### MEDIUM — Missing handling for nonexistent or invalid `user_id`; payment can be accepted with no credit and no alert  
+│ **Section:** Step 3: `UPDATE accounts SET balance = balance + :amount WHERE id = :user_id`; Step 4 returns `200 OK`.  
+│ **Failure mode:** If `user_id` is missing, malformed, stale, deleted, or references no account, the SQL update affects zero rows. The handler still returns `200 OK`, causing Stripe to stop retrying. The user paid but receives no credits, and the failure can be silent unless explicitly checked.  
+│ **Triggering input/condition:** Session metadata has `user_id = "deleted_account_123"` or metadata is absent. `UPDATE ... WHERE id = ...` updates 0 rows; handler returns `200`.  
+│ **Confidence:** 5
+│ 
+│ ---
+│ 
+│ ### MEDIUM — No amount sanity checks; zero, null, unexpectedly huge, or overflow values can corrupt balances  
+│ **Section:** Step 2 reads `session.amount_total`; Step 3 adds it directly.  
+│ **Failure mode:** The plan does not validate that amount is present, positive, within supported package limits, within DB numeric range, and in the expected currency/unit. A malformed/forged event, misconfigured Stripe price, or unexpected value can cause incorrect balances or DB errors.  
+│ **Triggering input/condition:** Fake payload has `amount_total = 9223372036854775807`, or a legitimate misconfigured Checkout price has an unintended amount. The update overflows or creates an impossible balance.  
+│ **Confidence:** 4
+│ 
+│ ---
+│ 
+│ ### MEDIUM — No durable event-processing record means crash-after-update is unrecoverable  
+│ **Section:** Step 3 updates balance; Step 4 returns `200 OK`; no event ledger/outbox/idempotency table.  
+│ **Failure mode:** If the process crashes after the balance update but before recording anything durable or returning `200`, there is no reliable way to know whether the event was already applied. Retrying risks double-crediting; suppressing retry risks missing credits. This is distinct from generic duplicate delivery: the plan has no atomic “mark event processed + apply balance change” transaction.  
+│ **Triggering input/condition:** Handler executes the balance update, then the process dies before response. Stripe retries. With no `processed_events(event_id)` row committed in the same transaction, handler applies the increment again.  
+│ **Confidence:** 5
+│ 
+│ ---
+│ 
+│ ### MEDIUM — Returning `200 OK` unconditionally hides failed database updates  
+│ **Section:** Step 4: “It returns `200 OK`.”  
+│ **Failure mode:** The plan does not distinguish successful balance update from DB error, validation failure, zero affected rows, or transient outage. Returning `200` on failure tells Stripe the webhook was handled, permanently dropping the event from retry.  
+│ **Triggering input/condition:** Database connection pool is exhausted or `accounts` table update fails. Handler catches/logs or ignores the error and still returns `200 OK` per the plan. User paid; no retry occurs.  
+│ **Confidence:** 3
+│ 
+│ ---
+│ 
+│ ### MEDIUM — No currency check permits cross-currency balance corruption  
+│ **Section:** Step 2 uses only `session.amount_total`; no currency is read or validated.  
+│ **Failure mode:** `amount_total = 1000` means different economic values depending on `currency`. Directly adding it to one balance field corrupts value when Checkout supports multiple currencies or Stripe Price configuration changes.  
+│ **Triggering input/condition:** One session is `1000 USD cents`, another is `1000 JPY` where JPY has no minor unit. Both add `1000` balance units despite different purchase values.  
+│ **Confidence:** 4
+│ 
+│ ---
+│ 
+│ ### MEDIUM — Webhook event type/object shape is underspecified; malformed but signed or irrelevant events can be processed incorrectly  
+│ **Section:** Step 1 says Stripe sends `checkout.session.completed`, but Step 2 assumes session fields exist.  
+│ **Failure mode:** The plan does not say to verify `event.type == "checkout.session.completed"` and that `data.object.object == "checkout.session"`. If the endpoint receives other Stripe events, test events, or malformed JSON, the handler may read missing fields as null/zero or throw and retry indefinitely.  
+│ **Triggering input/condition:** Stripe sends `payment_intent.succeeded` to the same endpoint. Handler attempts to read `session.amount_total` and `session.metadata.user_id` from a PaymentIntent-shaped object. Depending on implementation, it errors, credits wrong fields, or returns `200` after doing nothing.  
+│ **Confidence:** 3
+│ 
+│ ---
+│ 
+│ ## Highest-leverage fix first
+│ 
+│ Fix webhook authenticity and idempotent processing together: verify Stripe signature with the correct per-environment signing secret, reject wrong `livemode`/account, and process each Stripe `event.id` or Checkout Session ID exactly once in the same DB transaction as the balance update. This prevents both forged credit grants and duplicate-credit retries.  
+│ **Confidence this is real:** 5
+│ 
+│ VERDICT: FIX-BEFORE-SHIP
+
+┌─ reviewer 4: x-ai/grok-4.3  ·  FIX-BEFORE-SHIP
+│ CRITICAL: "Notes" bullet 2 ("We trust the payload...") + step 1. Failure mode: unauthenticated public endpoint accepts arbitrary JSON. Triggering input: attacker POST to /api/webhook with {"object":"checkout.session.completed","amount_total":999999,"metadata":{"user_id":"target"}} (or any valid-looking session object).
+│ 
+│ CRITICAL: Step 3 UPDATE + step 4 (no mention of Idempotency-Key or session.id dedup). Failure mode: at-least-once delivery produces duplicate increments. Triggering input: Stripe's normal retry of the same checkout.session.completed event (documented behavior on 5xx, network blip, or 2-minute timeout).
+│ 
+│ HIGH: Step 3 raw `balance = balance + :amount` (no version column, row lock, or transaction isolation stated). Failure mode: concurrent increments lose updates or over-apply. Triggering input: two distinct checkout.session.completed events for the same user arriving within the same DB transaction window.
+│ 
+│ MEDIUM: Step 2 ("reads session.amount_total and user_id from metadata"). Failure mode: missing or non-numeric fields produce silent wrong balance or SQL error that still returns 200. Triggering input: any session whose metadata lacks the expected keys or contains non-integer amount_total.
+│ 
+│ Highest-leverage fix first: add Stripe signature verification (HMAC) before any DB work; without it the other two defects are reachable by an unauthenticated attacker.
+│ 
+│ VERDICT: FIX-BEFORE-SHIP
+
+════════════════════════════════════════════════════════════
+
+★★★ JUDGE SYNTHESIS · google/gemini-3.5-flash ★★★
+
+CONSENSUS (≥2 reviewers, strong signal — fix it):
+- **No webhook signature verification** — `POST /api/webhook` — Triggered by sending unauthenticated POST requests with arbitrary payloads — Flagged by Reviewers 1, 2, 3, 4
+- **No idempotency control** — Steps 3–4 — Triggered by Stripe retrying the same event due to network timeouts or transient errors — Flagged by Reviewers 1, 2, 3, 4
+- **Unconditional 200 OK on zero-row updates** — Step 4 — Triggered by missing, malformed, or deleted `user_id` in metadata causing silent failures — Flagged by Reviewers 1, 2, 3, 4
+- **Stripe amount unit mismatch (cents vs. dollars/credits)** — Step 2 — Triggered by passing raw `amount_total` (cents) directly to a balance field expecting dollars or credits — Flagged by Reviewers 1, 2, 3
+- **Shared staging/production handler** — Notes — Triggered by test-mode events or misconfigured webhook URLs hitting the production database — Flagged by Reviewers 1, 2, 3
+- **Premature crediting for asynchronous payments** — Step 1 — Triggered by `checkout.session.completed` firing while `payment_status` is still "unpaid" (e.g., ACH, SEPA) — Flagged by Reviewers 2, 3
+- **Untrusted client-side metadata** — Step 2 — Triggered by attackers manipulating `metadata.user_id` during client-side checkout session creation — Flagged by Reviewers 1, 3
+- **No concurrency control on balance updates** — Step 3 — Triggered by concurrent delivery of events for the same user causing race conditions — Flagged by Reviewers 1, 4
+
+DISAGREEMENTS (reviewers conflict — YOU DECIDE HERE):
+—
+
+BLIND SPOTS (only 1 reviewer saw it but it looks real WITH a concrete trigger; or something ALL may have missed):
+- **Cross-currency balance corruption** — Triggered by processing sessions in different currencies (e.g., USD cents vs. JPY) without validating the currency field — Flagged by Reviewer 3
+- **Lack of transaction ledger/audit log** — Triggered by direct balance mutation without an immutable ledger, making reconciliation impossible — Flagged by Reviewer 2
+
+TO VERIFY (can't confirm from the input alone — check against real DB/runtime/schema BEFORE accepting or discarding):
+- **Database schema and balance unit** — Verify whether `accounts.balance` is stored as cents, dollars, or abstract credits to resolve the unit mismatch.
+- **Checkout Session creation logic** — Confirm if Checkout Sessions are created strictly server-side to prevent client-side metadata tampering.
+
+DISCARDED NOISE (hallucination / generic best-practice / no trigger):
+- **Database integer overflow on amount** — discarded because Stripe's API limits on transaction amounts prevent values large enough to trigger DB integer overflows.
+
+RECOMMENDATION (the single highest-leverage thing to do first):
+- Implement Stripe cryptographic signature verification using the official SDK, and wrap the balance update and event deduplication (using Stripe's event ID) in a single database transaction.
+
+VERDICT: FIX-BEFORE-SHIP
+
+────────────────────────────────────────────────────────────
