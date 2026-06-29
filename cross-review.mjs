@@ -50,21 +50,9 @@
  */
 
 import fs from 'node:fs';
-import { CHINA_VENDORS, callModel, costOf, liveModelIds, readStdin, resolveLang, langDirective } from './lib/openrouter.mjs';
+import { CHINA_VENDORS, PRICES, callModel, costOf, checkSlugs, readStdin, resolveLang, langDirective } from './lib/openrouter.mjs';
 
 const KEY = process.env.OPENROUTER_API_KEY;
-
-// Approx prices (USD per 1M tokens) for estimation only — fetched live from openrouter.ai.
-const PRICES = {
-  'openai/gpt-5.4-mini': { in: 0.75, out: 4.50 },
-  'openai/gpt-5.5': { in: 5.00, out: 30.0 },
-  'google/gemini-3.5-flash': { in: 1.50, out: 9.00 },
-  'google/gemini-3.1-pro-preview': { in: 2.00, out: 12.0 },
-  'x-ai/grok-4.3': { in: 1.25, out: 2.50 },
-  'z-ai/glm-5.2': { in: 1.40, out: 4.40 },
-  'moonshotai/kimi-k2.6': { in: 0.68, out: 3.41 },
-  'deepseek/deepseek-v4-pro': { in: 0.43, out: 0.87 },
-};
 
 // Default panel = MAX DIVERSITY of training lineage (the engine of the ensemble isn't power,
 // it's a distribution different from the one being reviewed). 4 independent vendors. The panel
@@ -160,11 +148,16 @@ function buildReviewerPrompt(o, content) {
   return `${TYPE_HINT[o.type] || TYPE_HINT.code}\n${o.context ? `\nContext: ${o.context}\n` : ''}\n--- BEGIN ${o.type.toUpperCase()} ---\n${content}\n--- END ---`;
 }
 
+// The judge sees reviewers as "REVIEWER N" WITHOUT the model slug: judging by
+// strength of evidence (and the PROMOTION signal) must not be colored by which
+// vendor said it — brand bias contaminates "2+ vendors agree", and a same-family
+// judge/reviewer pair invites self-enhancement bias. The N↔model map is preserved
+// in the raw-reviews display above the synthesis, so the reader de-anonymizes there.
 function buildJudgePrompt(o, content, reviews) {
   const reviewsBlock = reviews
-    .map((r, i) => `\n══ REVIEWER ${i + 1} (${r.model}) — VERDICT: ${extractVerdict(r.content) || '?'} ══\n${r.content}`)
+    .map((r, i) => `\n══ REVIEWER ${i + 1} — VERDICT: ${extractVerdict(r.content) || '?'} ══\n${r.content}`)
     .join('\n');
-  return `Reviewed artifact (${o.type.toUpperCase()})${o.context ? ` — context: ${o.context}` : ''}:\n--- BEGIN ---\n${content}\n--- END ---\n\nIndependent reviews (each reviewer was blind to the others):\n${reviewsBlock}\n\nNow synthesize per your rules.`;
+  return `Reviewed artifact (${o.type.toUpperCase()})${o.context ? ` — context: ${o.context}` : ''}:\n--- BEGIN ---\n${content}\n--- END ---\n\nIndependent reviews (each reviewer was blind to the others, and is shown to you anonymized — judge by evidence, not by source):\n${reviewsBlock}\n\nNow synthesize per your rules.`;
 }
 
 function extractVerdict(text) {
@@ -256,12 +249,7 @@ async function runPanel(o, content) {
 }
 
 async function runCheck(o) {
-  let live;
-  try { live = await liveModelIds(); } catch (e) { console.error(`ERROR fetching models: ${e.message}`); process.exit(1); }
-  const all = [...new Set([...o.reviewers, o.judge, DEFAULT_JUDGE, JUDGE_FALLBACK, ...SUGGEST])];
-  console.log('Slug validation against openrouter.ai/api/v1/models:\n');
-  for (const m of all) console.log(`  ${live.has(m) ? '✓ live' : '✗ DEAD'}  ${m}`);
-  console.log('\n(dead slug = OpenRouter retired it — swap before relying on an automated run)');
+  await checkSlugs([...o.reviewers, o.judge, DEFAULT_JUDGE, JUDGE_FALLBACK, ...SUGGEST]);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────

@@ -42,22 +42,9 @@
  */
 
 import fs from 'node:fs';
-import { CHINA_VENDORS, callModel, costOf, liveModelIds, readStdin, resolveLang, langDirective } from './lib/openrouter.mjs';
+import { CHINA_VENDORS, PRICES, callModel, costOf, checkSlugs, readStdin, resolveLang, langDirective } from './lib/openrouter.mjs';
 
 const KEY = process.env.OPENROUTER_API_KEY;
-
-// Real prices (USD/1M) fetched from openrouter.ai — for estimation only.
-const PRICES = {
-  'openai/gpt-5.4-mini': { in: 0.75, out: 4.50 },
-  'openai/gpt-5.5': { in: 5.00, out: 30.0 },
-  'google/gemini-3-flash-preview': { in: 0.50, out: 3.00 },
-  'google/gemini-3.5-flash': { in: 1.50, out: 9.00 },
-  'x-ai/grok-4.3': { in: 1.25, out: 2.50 },
-  'z-ai/glm-5.2': { in: 1.40, out: 4.40 },
-  'moonshotai/kimi-k2.6': { in: 0.68, out: 3.41 },
-  'deepseek/deepseek-v4-pro': { in: 0.43, out: 0.87 },
-  'anthropic/claude-opus-4.8': { in: 5.00, out: 25.0 },
-};
 
 // Default proposers: 4 independent training lineages, cheap-capable (the paper says a proposer
 // need not be strong — it needs to be DIVERSE). Region-inclusive (deliberate manual mode).
@@ -110,11 +97,15 @@ function buildProposerInput(o, working) {
   return `${o.context ? `Context: ${o.context}\n\n` : ''}${working}`;
 }
 
+// Sources are anonymized to the aggregator (Response A/B/C — no model slug) so it
+// can't favor a brand/family over the best-grounded answer. Same anti-bias move the
+// LLM-council design makes ("anonymized so the LLM can't play favorites"). The slug
+// is kept for display/json (--show-prompt, JSON), so the reader still sees who said what.
 function buildAggregateInput(working, proposals) {
   const block = proposals
-    .map((p, i) => `\n### Response from model ${i + 1} (${p.model})\n${p.content}`)
+    .map((p, i) => `\n### Response ${String.fromCharCode(65 + i)}\n${p.content}`)
     .join('\n');
-  return `Original request:\n${working}\n\nModel responses (each answered independently):\n${block}\n\nNow synthesize the single best answer, following your rules.`;
+  return `Original request:\n${working}\n\nResponses from independent sources (anonymized to prevent brand bias; each answered independently):\n${block}\n\nNow synthesize the single best answer, following your rules.`;
 }
 
 // ── Pipeline ─────────────────────────────────────────────────────────────────
@@ -184,11 +175,7 @@ async function runFusion(o, rawPrompt) {
 }
 
 async function runCheck(o) {
-  let live;
-  try { live = await liveModelIds(); } catch (e) { console.error(`ERROR fetching models: ${e.message}`); process.exit(1); }
-  const all = [...new Set([...o.proposers, ...SAFE_PROPOSERS, o.aggregator, AGG_FALLBACK, o.structurer, ...SUGGEST])];
-  console.log('Slug validation against openrouter.ai/api/v1/models:\n');
-  for (const m of all) console.log(`  ${live.has(m) ? '✓ live' : '✗ DEAD'}  ${m}`);
+  await checkSlugs([...o.proposers, ...SAFE_PROPOSERS, o.aggregator, AGG_FALLBACK, o.structurer, ...SUGGEST]);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
