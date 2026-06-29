@@ -49,7 +49,7 @@ crossfire is the smallest possible tool that turns that idea into a command. Two
 - **`crossfire review`** — *catch*. An adversarial reviewer (or a blind panel + judge) from a different vendor tears your plan, diff, or code apart **before** you execute it.
 - **`crossfire fuse`** — *generate*. Mixture-of-Agents: several diverse models answer in parallel, a strong aggregator synthesizes the single best answer.
 
-No SDKs, no framework, no account beyond one OpenRouter key. ~330 lines of Node, native `fetch` only.
+No SDKs, no framework, no account beyond one OpenRouter key — just two small commands over a shared HTTP layer, native `fetch`, zero dependencies.
 
 ---
 
@@ -73,6 +73,29 @@ Input comes from a **file argument or stdin**, so it pipes from `git diff`, your
 ```bash
 git diff main...HEAD | crossfire review --type diff
 ```
+
+---
+
+## Commands & flags
+
+```bash
+crossfire review <file|->   [flags]    # critique a plan / diff / code
+crossfire fuse   "<prompt>"  [flags]   # generate the best answer (mixture-of-agents)
+```
+
+| Flag | review | fuse | What it does |
+|------|:------:|:----:|------|
+| `--type plan\|diff\|code` | ✓ | | how to read the input (default `code`) |
+| `--panel` | ✓ | | N blind reviewers + a judge (default is solo) |
+| `--no-structure` | | ✓ | skip the prompt-cleanup step |
+| `--show-prompt` | | ✓ | also print the structured prompt + each proposal |
+| `--safe` | ✓ | ✓ | Western-vendor set only — for client / regulated data |
+| `--context "..."` | ✓ | ✓ | extra context handed to every model |
+| `--lang pt\|es\|fr\|de` | ✓ | ✓ | output language (default `en`) |
+| `--json` | ✓ | ✓ | machine-readable output |
+| `--check` | ✓ | ✓ | validate every model slug against OpenRouter, then exit |
+| `--model` `--reviewers` `--judge` | ✓ | | override which models run (solo / panel) |
+| `--proposers` `--aggregator` | | ✓ | override which models run |
 
 ---
 
@@ -181,6 +204,7 @@ the calls you can't easily undo.
 - **Never throws on a network blip** — a connection hiccup can't make the gate report "no issues found". Network errors retry; HTTP errors don't (they're deterministic).
 - **Panel degrades gracefully** — dead model slug? Skipped, the panel continues. Judge dies? Falls back to a different vendor. One reviewer left? It says so instead of faking a consensus.
 - **Raw reviews printed before the judge's synthesis** — you can always audit the judge against the source. Never accept a synthesis blind.
+- **The judge is blind to who said what** — reviews and proposals reach the judge/aggregator anonymized (`Response A/B/C`), so a familiar brand can't sway the verdict and no model can favor its own family. You still see every vendor in the output; only the judge is kept blind.
 - **Confidence-capped findings** — a reviewer that can't name the exact input that triggers a failure is capped at low confidence, so you can discard hallucinated "bugs".
 - **Slugs rot** — `crossfire review --check` validates every model slug against OpenRouter's live catalog. A weekly CI job ([`.github/workflows/slug-check.yml`](.github/workflows/slug-check.yml)) does it for you.
 
