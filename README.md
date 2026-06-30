@@ -136,6 +136,31 @@ The judge does **not** average the reviews. It distills signal into sections:
 
 Every reviewer ends on a hard verdict — `SHIP` / `FIX-BEFORE-SHIP` / `RECONSIDER-APPROACH`. No hedging.
 
+### Agreement signal
+
+A panel run closes with a **mechanical agreement line** — how many of the independent reviewers reached the *same* verdict:
+
+```text
+  ⊢ reviewer agreement: 4/4 on FIX-BEFORE-SHIP (unanimous)
+```
+
+This is a **raw count across different labs, not a model-emitted "confidence %"** — and that distinction is the entire point. Asking one model to score its own answer is theater: a hallucination is a high-confidence wrong answer *by definition*, so the model that's wrong is the last one to know it. Four labs independently landing on the same verdict, on the other hand, is real, cheap signal. The count is honest about its own limits, too:
+
+- **Split** → `2/4 — SPLIT (SHIP vs FIX-BEFORE-SHIP), no majority: treat the call as genuinely open`. A tie is information, not a number to average into a fake winner — so in `--json`, `agreement.verdict` is `null` on a split and an automation can't act on a coin flip.
+- **Unparseable** → the denominator is the reviewers that *ran*, never just the ones that emitted a parseable verdict. A missed verdict can therefore never inflate the tally into a false "1/1 unanimous"; misses are shown explicitly (`· 1 unparseable`).
+
+In `--json` it's a structured field:
+
+```json
+"agreement": {
+  "verdict": "FIX-BEFORE-SHIP", "label": "4/4", "leaders": ["FIX-BEFORE-SHIP"],
+  "count": 4, "total": 4, "parseable": 4, "unparseable": 0,
+  "unanimous": true, "split": false
+}
+```
+
+> The line above is a real, unedited run — crossfire reviewing a deliberately broken `average()` with an `i <= nums.length` off-by-one. Four vendors (GLM, Kimi, GPT, Grok) each returned `FIX-BEFORE-SHIP`, so the count is `4/4` — not a number anyone made up. Try it: `crossfire review <a-buggy-file> --type code --panel`.
+
 ```bash
 crossfire review migration.sql --type diff --panel
 crossfire review plan.md --type plan --solo --model openai/gpt-5.4-mini
@@ -206,6 +231,7 @@ the calls you can't easily undo.
 - **Raw reviews printed before the judge's synthesis** — you can always audit the judge against the source. Never accept a synthesis blind.
 - **The judge is blind to who said what** — reviews and proposals reach the judge/aggregator anonymized (`Response A/B/C`), so a familiar brand can't sway the verdict and no model can favor its own family. You still see every vendor in the output; only the judge is kept blind.
 - **Confidence-capped findings** — a reviewer that can't name the exact input that triggers a failure is capped at low confidence, so you can discard hallucinated "bugs".
+- **Agreement is a count, not a vibe** — the panel's agreement line is a raw tally of independent verdicts, never a self-reported "confidence %". The denominator is the reviewers that ran (an unparseable verdict can't fake unanimity), and a split reports `verdict: null` so nothing downstream acts on a tie.
 - **Slugs rot** — `crossfire review --check` validates every model slug against OpenRouter's live catalog. A weekly CI job ([`.github/workflows/slug-check.yml`](.github/workflows/slug-check.yml)) does it for you.
 
 ## Cost & configuration

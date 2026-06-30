@@ -163,8 +163,37 @@ function buildJudgePrompt(o, content, reviews) {
 function extractVerdict(text) {
   // tolerate markdown around the verdict (e.g. "VERDICT: **FIX-BEFORE-SHIP**") — models
   // format in bold/italic and that broke extraction (judge showed up as "null").
-  const m = /VERDICT[:\s*_`-]*\b(SHIP|FIX-BEFORE-SHIP|RECONSIDER-APPROACH)\b/i.exec(text || '');
-  return m ? m[1].toUpperCase() : null;
+  // Take the LAST match, not the first: the verdict is the mandatory FINAL line, and reviewers
+  // routinely quote example verdicts ("VERDICT: SHIP") earlier in their prose. First-match-wins
+  // mis-parsed those reviewers — a real panel run reported 2/4 SPLIT when it was 4/4 unanimous.
+  const re = /VERDICT[:\s*_`-]*\b(SHIP|FIX-BEFORE-SHIP|RECONSIDER-APPROACH)\b/gi;
+  let m, last = null;
+  while ((m = re.exec(text || '')) !== null) last = m[1];
+  return last ? last.toUpperCase() : null;
+}
+
+// Mechanical agreement — counts how many independent reviewers reached the SAME verdict.
+// Deliberately NOT a model-emitted "confidence %": a raw count across DIFFERENT training
+// distributions is the only honest cheap signal. Named "agreement", not "confidence", on
+// purpose — N/N reviewers can share a blind spot and all be wrong; "confidence" would
+// overclaim. A split (no majority) is information: the call is genuinely open, not noise.
+function agreementOf(verdicts, totalReviewers) {
+  if (!totalReviewers) return null;
+  const counts = {};
+  for (const v of verdicts) counts[v] = (counts[v] || 0) + 1;
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const top = entries.length ? entries[0][1] : 0;
+  const leaders = entries.filter(([, c]) => c === top).map(([v]) => v); // tied max verdict(s)
+  // SPLIT = a tie among leaders OR the leader isn't a strict majority of the FULL panel.
+  // Denominator is the reviewers that RAN (totalReviewers), never just the parseable ones —
+  // otherwise one unparseable verdict silently fabricates "1/1 unanimous".
+  const split = leaders.length !== 1 || top * 2 <= totalReviewers;
+  return {
+    verdict: split ? null : leaders[0],   // null in a split — never expose an arbitrary "winner" to JSON
+    leaders, count: top, total: totalReviewers, parseable: verdicts.length,
+    unparseable: totalReviewers - verdicts.length, label: `${top}/${totalReviewers}`,
+    unanimous: top === totalReviewers, split, distribution: counts,
+  };
 }
 
 // ── Modes ────────────────────────────────────────────────────────────────────
@@ -219,9 +248,15 @@ async function runPanel(o, content) {
   const judgeCost = judge.ok ? (costOf(judge.model, judge.usage, PRICES) || 0) : 0;
   const total = reviewerCost + judgeCost;
 
+  // Agreement = how many independent reviewers landed on the same verdict (mechanical count).
+  // Denominator = ok.length (reviewers that ran), so an unparseable verdict can't fake unanimity.
+  const verdicts = ok.map((r) => extractVerdict(r.content)).filter(Boolean);
+  const agreement = agreementOf(verdicts, ok.length);
+
   if (o.json) {
     console.log(JSON.stringify({
       mode: 'panel',
+      agreement,
       reviewers: ok.map((r) => ({ model: r.model, verdict: extractVerdict(r.content), review: r.content, cost: costOf(r.model, r.usage, PRICES) })),
       failed: failed.map((f) => ({ model: f.model, error: f.error })),
       judge: judge.ok ? { model: judge.model, verdict: extractVerdict(judge.content), synthesis: judge.content, cost: judgeCost } : { error: judge.error },
@@ -243,9 +278,19 @@ async function runPanel(o, content) {
   } else {
     console.error(`\nERROR: judge failed (${judge.error}). Raw reviews above — synthesize by hand.`);
   }
+  if (agreement) {
+    let line;
+    if (agreement.parseable === 0) line = `0/${agreement.total} reviewers emitted a parseable verdict — agreement signal unavailable`;
+    else if (agreement.unanimous) line = `${agreement.label} on ${agreement.verdict} (unanimous)`;
+    else if (agreement.split && agreement.leaders.length > 1) line = `${agreement.label} — SPLIT (${agreement.leaders.join(' vs ')}), no majority: treat the call as genuinely open`;
+    else if (agreement.split) line = `${agreement.label} on ${agreement.leaders[0]} — plurality, no majority of the panel`;
+    else line = `${agreement.label} on ${agreement.verdict}`;
+    if (agreement.unparseable && agreement.parseable !== 0) line += ` · ${agreement.unparseable} unparseable`;
+    console.log(`\n  ⊢ reviewer agreement: ${line}`);
+  }
   console.log(`\n${'─'.repeat(60)}`);
-  const verdicts = ok.map((r) => extractVerdict(r.content)).filter(Boolean);
-  console.error(`[panel: ${ok.length} ok${failed.length ? `, ${failed.length} failed` : ''} · reviewer verdicts: ${verdicts.join(', ') || '?'} · judge: ${judge.ok ? extractVerdict(judge.content) : 'FAILED'} · ~$${total.toFixed(4)}]`);
+  const agStr = agreement ? `${agreement.label} ${agreement.verdict ? 'on ' + agreement.verdict : (agreement.parseable ? 'SPLIT' : 'no parseable verdict')}` : '?';
+  console.error(`[panel: ${ok.length} ok${failed.length ? `, ${failed.length} failed` : ''} · reviewer verdicts: ${verdicts.join(', ') || '?'} · agreement: ${agStr} · judge: ${judge.ok ? extractVerdict(judge.content) : 'FAILED'} · ~$${total.toFixed(4)}]`);
 }
 
 async function runCheck(o) {
