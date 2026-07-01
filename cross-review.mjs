@@ -124,8 +124,8 @@ Judging rules:
 
 Answer DIRECTLY, in exactly these sections (omit a section only if it would be empty, writing "—"):
 
-CONSENSUS (≥2 reviewers, strong signal — fix it):
-- <defect> — <file/section:line> — triggered by <input/condition> — flagged by <which reviewers>
+CONSENSUS (≥2 reviewers, strong signal — fix it). Prefix EACH item with [N/M]: N = how many of the M reviewers independently flagged THIS specific defect (count honestly from the reviews above), M = panel size. This per-finding count is how the reader triages — the highest N is the surest bug:
+- [N/M] <defect> — <file/section:line> — triggered by <input/condition> — flagged by <which reviewers>
 
 DISAGREEMENTS (reviewers conflict — YOU DECIDE HERE):
 - <point> — Reviewer X says A / Reviewer Y says B — real trade-off: <...>
@@ -157,7 +157,7 @@ function buildJudgePrompt(o, content, reviews) {
   const reviewsBlock = reviews
     .map((r, i) => `\n══ REVIEWER ${i + 1} — VERDICT: ${extractVerdict(r.content) || '?'} ══\n${r.content}`)
     .join('\n');
-  return `Reviewed artifact (${o.type.toUpperCase()})${o.context ? ` — context: ${o.context}` : ''}:\n--- BEGIN ---\n${content}\n--- END ---\n\nIndependent reviews (each reviewer was blind to the others, and is shown to you anonymized — judge by evidence, not by source):\n${reviewsBlock}\n\nNow synthesize per your rules.`;
+  return `Reviewed artifact (${o.type.toUpperCase()})${o.context ? ` — context: ${o.context}` : ''}:\n--- BEGIN ---\n${content}\n--- END ---\n\nIndependent reviews from ${reviews.length} reviewers (panel size M = ${reviews.length}; each was blind to the others, and is shown to you anonymized — judge by evidence, not by source; the [N/M] per-finding counts you emit use this M):\n${reviewsBlock}\n\nNow synthesize per your rules.`;
 }
 
 function extractVerdict(text) {
@@ -194,6 +194,21 @@ function agreementOf(verdicts, totalReviewers) {
     unparseable: totalReviewers - verdicts.length, label: `${top}/${totalReviewers}`,
     unanimous: top === totalReviewers, split, distribution: counts,
   };
+}
+
+// Best-effort extraction of the judge's per-finding promotion counts (the [N/M] tags on CONSENSUS
+// items). Purely additive to --json — if the judge doesn't tag, returns [] and nothing breaks.
+// This is the finding-level agreement: which SPECIFIC defect the most independent labs flagged.
+function parseConsensusFindings(judgeText) {
+  const out = [];
+  // tolerate any mix of list markers + markdown emphasis before the [N/M] tag — judges wrap the
+  // line in bold ("*   **[4/4] ...**"), which a strict "^-? \[" prefix missed (proven on a real run).
+  const re = /^[\s>*_`-]*\[(\d+)\/(\d+)\]\s*(.+)$/gm;
+  let m;
+  while ((m = re.exec(judgeText || '')) !== null) {
+    out.push({ count: +m[1], total: +m[2], finding: m[3].replace(/\*\*/g, '').replace(/[\s*_]+$/, '').trim() });
+  }
+  return out.sort((a, b) => b.count - a.count);
 }
 
 // ── Modes ────────────────────────────────────────────────────────────────────
@@ -257,6 +272,7 @@ async function runPanel(o, content) {
     console.log(JSON.stringify({
       mode: 'panel',
       agreement,
+      consensusFindings: judge.ok ? parseConsensusFindings(judge.content) : [],
       reviewers: ok.map((r) => ({ model: r.model, verdict: extractVerdict(r.content), review: r.content, cost: costOf(r.model, r.usage, PRICES) })),
       failed: failed.map((f) => ({ model: f.model, error: f.error })),
       judge: judge.ok ? { model: judge.model, verdict: extractVerdict(judge.content), synthesis: judge.content, cost: judgeCost } : { error: judge.error },

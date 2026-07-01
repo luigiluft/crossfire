@@ -159,6 +159,13 @@ In `--json` it's a structured field:
 }
 ```
 
+**Finding-level agreement.** The count above is per *verdict*. In a panel, the judge also tags each CONSENSUS defect with `[N/M]` — how many of the M reviewers flagged *that specific bug* — and `--json` exposes them sorted, strongest first, in `consensusFindings`. So you don't just learn "the panel says fix something"; you learn *which* defect is surest and triage by the highest N:
+
+```text
+  [4/4] off-by-one loop → returns NaN for every input
+  [3/4] parseInt silently truncates decimal cells
+```
+
 > The line above is a real, unedited run — crossfire reviewing a deliberately broken `average()` with an `i <= nums.length` off-by-one. Four vendors (GLM, Kimi, GPT, Grok) each returned `FIX-BEFORE-SHIP`, so the count is `4/4` — not a number anyone made up. Try it: `crossfire review <a-buggy-file> --type code --panel`.
 
 ```bash
