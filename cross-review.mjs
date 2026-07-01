@@ -200,12 +200,19 @@ function agreementOf(verdicts, totalReviewers) {
 // items). Purely additive to --json — if the judge doesn't tag, returns [] and nothing breaks.
 // This is the finding-level agreement: which SPECIFIC defect the most independent labs flagged.
 function parseConsensusFindings(judgeText) {
+  const t = judgeText || '';
+  // Scope to the CONSENSUS section ONLY — [N/M] also shows up in DISAGREEMENTS/examples, and those
+  // are not consensus findings (a real run leaked a [1/3] disagreement into the array otherwise).
+  const start = t.search(/^[\s#*_>-]*CONSENSUS/im);
+  if (start === -1) return [];
+  const after = t.slice(start).replace(/^[^\n]*\n/, ''); // drop the CONSENSUS header line itself
+  const endRel = after.search(/^[\s#*_>-]*(DISAGREEMENT|BLIND|TO VERIFY|DISCARD|RECOMMEND|VERDICT)/im);
+  const section = endRel === -1 ? after : after.slice(0, endRel);
   const out = [];
-  // tolerate any mix of list markers + markdown emphasis before the [N/M] tag — judges wrap the
-  // line in bold ("*   **[4/4] ...**"), which a strict "^-? \[" prefix missed (proven on a real run).
+  // tolerate any mix of list markers + markdown emphasis before the [N/M] tag (judges wrap in bold).
   const re = /^[\s>*_`-]*\[(\d+)\/(\d+)\]\s*(.+)$/gm;
   let m;
-  while ((m = re.exec(judgeText || '')) !== null) {
+  while ((m = re.exec(section)) !== null) {
     out.push({ count: +m[1], total: +m[2], finding: m[3].replace(/\*\*/g, '').replace(/[\s*_]+$/, '').trim() });
   }
   return out.sort((a, b) => b.count - a.count);
