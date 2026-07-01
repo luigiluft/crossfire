@@ -11,7 +11,7 @@
 
 <p align="center">
   <b>A model from a different lab attacks your work before you ship it.</b><br>
-  Cross-vendor adversarial review <i>and</i> mixture-of-agents — in one zero-dependency CLI.
+  Adversarial review, mixture-of-agents <i>and</i> a lens council — in one zero-dependency CLI.
 </p>
 
 ---
@@ -27,6 +27,7 @@
   <a href="#quickstart">Quickstart</a> ·
   <a href="#review-adversarial-catch">Review</a> ·
   <a href="#fuse-mixture-of-agents">Fuse</a> ·
+  <a href="#decide-lens-council">Decide</a> ·
   <a href="#why-cross-vendor">Why cross-vendor</a> ·
   <a href="#design-notes">Design</a>
 </p>
@@ -44,12 +45,13 @@ different training distribution, so it flags the thing yours talked itself past.
 models from *different* vendors independently flag the same defect, that agreement is the
 strongest signal of a real bug you can get cheaply.
 
-crossfire is the smallest possible tool that turns that idea into a command. Two axes:
+crossfire is the smallest possible tool that turns that idea into a command. Three axes:
 
 - **`crossfire review`** — *catch*. An adversarial reviewer (or a blind panel + judge) from a different vendor tears your plan, diff, or code apart **before** you execute it.
 - **`crossfire fuse`** — *generate*. Mixture-of-Agents: several diverse models answer in parallel, a strong aggregator synthesizes the single best answer.
+- **`crossfire decide`** — *decide*. A lens council: one model answers an open question N times, each blind take forced onto a different lens (execution, user, risk, contrarian), and a judge surfaces where they diverge — which is where *you* decide.
 
-No SDKs, no framework, no account beyond one OpenRouter key — just two small commands over a shared HTTP layer, native `fetch`, zero dependencies.
+Review and fuse span **different vendors**; decide is deliberately **single-model**, because on an open question with no artifact the diversity that matters is the *angle*, not the lab. No SDKs, no framework, no account beyond one OpenRouter key — three small commands over a shared HTTP layer, native `fetch`, zero dependencies.
 
 ---
 
@@ -79,23 +81,27 @@ git diff main...HEAD | crossfire review --type diff
 ## Commands & flags
 
 ```bash
-crossfire review <file|->   [flags]    # critique a plan / diff / code
-crossfire fuse   "<prompt>"  [flags]   # generate the best answer (mixture-of-agents)
+crossfire review <file|->    [flags]   # critique a plan / diff / code
+crossfire fuse   "<prompt>"   [flags]   # generate the best answer (mixture-of-agents)
+crossfire decide "<question>" [flags]   # decide an open question (lens council)
 ```
 
-| Flag | review | fuse | What it does |
-|------|:------:|:----:|------|
-| `--type plan\|diff\|code` | ✓ | | how to read the input (default `code`) |
-| `--panel` | ✓ | | N blind reviewers + a judge (default is solo) |
-| `--no-structure` | | ✓ | skip the prompt-cleanup step |
-| `--show-prompt` | | ✓ | also print the structured prompt + each proposal |
-| `--safe` | ✓ | ✓ | Western-vendor set only — for client / regulated data |
-| `--context "..."` | ✓ | ✓ | extra context handed to every model |
-| `--lang pt\|es\|fr\|de` | ✓ | ✓ | output language (default `en`) |
-| `--json` | ✓ | ✓ | machine-readable output |
-| `--check` | ✓ | ✓ | validate every model slug against OpenRouter, then exit |
-| `--model` `--reviewers` `--judge` | ✓ | | override which models run (solo / panel) |
-| `--proposers` `--aggregator` | | ✓ | override which models run |
+| Flag | review | fuse | decide | What it does |
+|------|:------:|:----:|:------:|------|
+| `--type plan\|diff\|code` | ✓ | | | how to read the input (default `code`) |
+| `--panel` | ✓ | | | N blind reviewers + a judge (default is solo) |
+| `--no-structure` | | ✓ | | skip the prompt-cleanup step |
+| `--show-prompt` | | ✓ | | also print the structured prompt + each proposal |
+| `--known "..."` | | | ✓ | what you already concluded — lenses go *beyond*, not re-derive |
+| `--lens "..."` | | | ✓ | replace a default lens (repeatable, once per lens) |
+| `--show-lenses` | | | ✓ | also print each advisor's raw answer |
+| `--safe` | ✓ | ✓ | ✓ | Western-vendor set only — for client / regulated data |
+| `--context "..."` | ✓ | ✓ | ✓ | extra context handed to every model |
+| `--lang pt\|es\|fr\|de` | ✓ | ✓ | ✓ | output language (default `en`) |
+| `--json` | ✓ | ✓ | ✓ | machine-readable output |
+| `--check` | ✓ | ✓ | ✓ | validate every model slug against OpenRouter, then exit |
+| `--model` `--reviewers` `--judge` | ✓ | | ✓ | override which models run |
+| `--proposers` `--aggregator` | | ✓ | | override which models run |
 
 ---
 
@@ -188,6 +194,32 @@ crossfire fuse prompt.md --show-prompt        # show the structured prompt + eac
 
 Based on [Mixture-of-Agents Enhances LLM Capabilities](https://arxiv.org/abs/2406.04692) (Wang et al., 2024).
 
+## Decide: lens council
+
+For an **open question with no artifact to review** — "which stack?", "expand this product or not?", "how should I structure these agents?". Where `review` critiques and `fuse` generates, `decide` helps you *choose*. Pipeline:
+
+1. **Fan out** — one model answers the question N times in parallel, each call blind to the others and forced onto a single **lens**.
+2. **Judge** — a strong model distills the takes: promotes what ≥2 lenses share, and **surfaces divergence instead of resolving it**, because an open call is yours to make.
+
+The four default lenses are deliberately adversarial to each other:
+
+| Lens | Pushes on |
+|------|-----------|
+| **execution architect** | how to actually build it — dependencies, order, real effort, what breaks |
+| **product & user** | the job-to-be-done; what moves the needle vs. what's vanity |
+| **risk, scale & cost** | failure modes, maintenance cost, what cracks under scale |
+| **contrarian** | assumes the obvious answer is wrong — the case for doing *nothing* |
+
+```bash
+crossfire decide "should we move the CRM off Airtable onto Postgres?"
+crossfire decide plan.md --known "leaning yes, worried about the migration window"
+crossfire decide "..." --lens "legal & compliance — ..." --lens "hiring & team — ..."
+```
+
+The judge answers in four sections — **Consensus** (≥2 lenses converge), **Divergences** (where you decide), **Blind spots** (only one saw it, or all missed it), **Recommendation** (highest-leverage first move). Pass **`--known`** with what you've already concluded and the judge tags every point `[NEW]` or `[CONFIRMS]` and leads with the `[NEW]` — so you pay for insight past what you already had, not a restatement of it.
+
+**Single-model on purpose.** `fuse` mixes vendors because raw generation gains from many training distributions. `decide` fixes one model and varies the *lens*, because on a judgment call the useful diversity is the angle of attack, not the lab — and holding the model constant keeps the lenses comparable. Override with `--model` / `--judge` if you want a specific reasoner in the chairs.
+
 ---
 
 ## Why cross-vendor
@@ -244,12 +276,13 @@ the calls you can't easily undo.
 ## Cost & configuration
 
 Cost is live-estimated from OpenRouter pricing and printed to stderr after each run. Ballpark:
-solo review ≈ $0.002, panel ≈ $0.05–0.20 (scales with artifact size), fuse ≈ $0.10–0.17. You
-bring your own key; crossfire takes no cut.
+solo review ≈ $0.002, panel ≈ $0.05–0.20 (scales with artifact size), fuse ≈ $0.10–0.17,
+decide ≈ $0.10–0.25. You bring your own key; crossfire takes no cut.
 
-Default model slugs live at the top of `cross-review.mjs` and `fusion.mjs`. Override per run with
-`--reviewers`, `--judge`, `--model` (review) or `--proposers`, `--aggregator` (fuse). Run
-`crossfire review --check` to see which slugs are still live and swap as needed.
+Default model slugs live at the top of `cross-review.mjs`, `fusion.mjs`, and `mini-fusion.mjs`.
+Override per run with `--reviewers`, `--judge`, `--model` (review), `--proposers`, `--aggregator`
+(fuse), or `--model`, `--judge` (decide). Run `crossfire review --check` (or `decide --check`) to
+see which slugs are still live and swap as needed.
 
 ## License
 

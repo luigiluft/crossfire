@@ -1,7 +1,7 @@
 {
   "name": "crossfire",
   "version": "0.1.0",
-  "description": "Cross-vendor LLM ensemble for AI coding agents: adversarial review (catch) + mixture-of-agents (generate). Zero dependencies, one OpenRouter key.",
+  "description": "Cross-vendor LLM ensemble for AI coding agents: adversarial review (catch) + mixture-of-agents (generate) + lens ensemble (decide). Zero dependencies, one OpenRouter key.",
   "type": "module",
   "bin": {
     "crossfire": "bin/crossfire.mjs"
@@ -12,12 +12,14 @@
   "scripts": {
     "review": "node cross-review.mjs",
     "fuse": "node fusion.mjs",
+    "decide": "node mini-fusion.mjs",
     "check": "node cross-review.mjs --check"
   },
   "files": [
     "bin",
     "cross-review.mjs",
     "fusion.mjs",
+    "mini-fusion.mjs",
     "lib",
     "README.md",
     "LICENSE"
@@ -28,6 +30,8 @@
     "adversarial-review",
     "mixture-of-agents",
     "moa",
+    "ensemble",
+    "decision-support",
     "openrouter",
     "ai-agents",
     "claude-code",
