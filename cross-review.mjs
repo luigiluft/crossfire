@@ -33,7 +33,7 @@
  *   --type plan|diff|code (default code)
  *   --context "..."
  *   --lang <code>       (output language: en|pt|es|fr|de; default env CROSSFIRE_LANG or en)
- *   --model <slug>      (solo reviewer; default openai/gpt-5.4-mini)
+ *   --model <slug>      (solo reviewer; default openai/gpt-5.4)
  *   --reviewers a,b,c   (panel; default 4 lineages GLM+Kimi+GPT+Grok; --safe = Google+OpenAI+xAI)
  *   --judge <slug>      (panel judge; default gemini-3.5-flash, fallback gpt-5.5)
  *   --json              (JSON output; suppresses formatted text)
@@ -71,7 +71,7 @@ const SUGGEST = Object.keys(PRICES);
 
 function parseArgs(argv) {
   const o = {
-    mode: 'solo', model: 'openai/gpt-5.4-mini', type: 'code', context: '',
+    mode: 'solo', model: 'openai/gpt-5.4', type: 'code', context: '',
     file: null, reviewers: null, judge: DEFAULT_JUDGE, json: false, safe: false, lang: null,
   };
   for (let i = 0; i < argv.length; i++) {

@@ -27,6 +27,7 @@
  *
  * Flags:
  *   --safe            proposers Western-only (no region-sensitive vendors) — for client data
+ *   --max / --beast   strongest diverse lineages at max reasoning (highest-value generation, ~$0.30-0.60)
  *   --no-structure    skip step 1 (send the raw prompt straight to proposers)
  *   --show-prompt     print the structured prompt + each proposal (auditable)
  *   --lang <code>     output language: en|pt|es|fr|de (default env CROSSFIRE_LANG or en)
@@ -56,17 +57,30 @@ const DEFAULT_AGGREGATOR = 'openai/gpt-5.5';
 const AGG_FALLBACK = 'anthropic/claude-opus-4.8'; // strong and reliable if the primary aggregator drops
 const DEFAULT_STRUCTURER = 'openai/gpt-5.4-mini'; // cheap-capable for rewriting the prompt
 
+// --max ("beast" mode): the strongest DIVERSE lineages at max reasoning effort, for the
+// highest-value generation. 5 distinct frontier lineages as proposers; the top-Intelligence-
+// Index model as aggregator (where quality concentrates). Region-inclusive; --safe drops China.
+const MAX_PROPOSERS = ['google/gemini-3.1-pro-preview', 'z-ai/glm-5.2', 'deepseek/deepseek-v4-pro', 'qwen/qwen3.7-max', 'moonshotai/kimi-k2.6'];
+const MAX_SAFE_PROPOSERS = ['google/gemini-3.1-pro-preview', 'x-ai/grok-4.3', 'openai/gpt-5.4'];
+// Aggregator = strongest NON-Claude (GPT-5.5, 54.8 — just -0.9 vs Opus 4.8). Deliberately not
+// Claude: the fusion output is consumed by an Opus 4.8 caller (Claude Code), so a Claude aggregator
+// would collapse the ensemble back into the caller's own perspective. Non-Claude everywhere in
+// --max ⇒ every returned token is from a lineage the caller doesn't already have. (Opus stays only
+// as AGG_FALLBACK for outage resilience.)
+const MAX_AGGREGATOR = 'openai/gpt-5.5';
+
 const SUGGEST = Object.keys(PRICES);
 
 function parseArgs(argv) {
   const o = {
-    structure: true, safe: false, showPrompt: false, json: false, context: '', lang: null,
+    structure: true, safe: false, showPrompt: false, json: false, context: '', lang: null, max: false, effort: null,
     prompt: null, file: null, proposers: null, aggregator: DEFAULT_AGGREGATOR, structurer: DEFAULT_STRUCTURER,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--no-structure') o.structure = false;
     else if (a === '--safe') o.safe = true;
+    else if (a === '--max' || a === '--beast') o.max = true;
     else if (a === '--show-prompt') o.showPrompt = true;
     else if (a === '--json') o.json = true;
     else if (a === '--context') o.context = argv[++i];
@@ -79,7 +93,14 @@ function parseArgs(argv) {
     else if (a === '--check') o.check = true;
     else if (!a.startsWith('--')) o.prompt = (o.prompt ? o.prompt + ' ' : '') + a;
   }
-  if (!o.proposers) o.proposers = o.safe ? SAFE_PROPOSERS : DEFAULT_PROPOSERS;
+  if (!o.proposers) {
+    if (o.max) o.proposers = o.safe ? MAX_SAFE_PROPOSERS : MAX_PROPOSERS;
+    else o.proposers = o.safe ? SAFE_PROPOSERS : DEFAULT_PROPOSERS;
+  }
+  if (o.max) {
+    if (o.aggregator === DEFAULT_AGGREGATOR) o.aggregator = MAX_AGGREGATOR; // unless user overrode --aggregator
+    o.effort = 'xhigh'; // force max reasoning on proposers + aggregator (clamps per-model)
+  }
   o.lang = resolveLang(o.lang);
   return o;
 }
@@ -126,7 +147,7 @@ async function runFusion(o, rawPrompt) {
   // STEP 2 — proposers in parallel (independence is the engine of the ensemble)
   const proposerInput = buildProposerInput(o, working);
   const proposerSystem = PROPOSER_SYSTEM + langDirective(o.lang);
-  const settled = await Promise.all(o.proposers.map((m) => callModel(m, proposerSystem, proposerInput, 0.7, 1, 'crossfire-fuse')));
+  const settled = await Promise.all(o.proposers.map((m) => callModel(m, proposerSystem, proposerInput, 0.7, 1, 'crossfire-fuse', o.effort)));
   const ok = settled.filter((r) => r.ok);
   const failed = settled.filter((r) => !r.ok);
   for (const f of failed) if (!o.json) console.error(`[fuse] proposer skipped — ${f.model}: ${f.error}`);
@@ -135,10 +156,10 @@ async function runFusion(o, rawPrompt) {
   // STEP 3 — aggregator synthesizes (with a different-vendor fallback)
   const aggSystem = AGGREGATE_SYSTEM + langDirective(o.lang);
   const aggInput = buildAggregateInput(working, ok);
-  let agg = await callModel(o.aggregator, aggSystem, aggInput, 0.4, 1, 'crossfire-fuse');
+  let agg = await callModel(o.aggregator, aggSystem, aggInput, 0.4, 1, 'crossfire-fuse', o.effort);
   if (!agg.ok && o.aggregator !== AGG_FALLBACK) {
     if (!o.json) console.error(`[fuse] aggregator ${o.aggregator} failed (${agg.error}) → fallback ${AGG_FALLBACK}`);
-    agg = await callModel(AGG_FALLBACK, aggSystem, aggInput, 0.4, 1, 'crossfire-fuse');
+    agg = await callModel(AGG_FALLBACK, aggSystem, aggInput, 0.4, 1, 'crossfire-fuse', o.effort);
   }
   if (!agg.ok) { console.error(`ERROR: aggregator failed (${agg.error}). Raw proposals were not synthesized.`); process.exit(1); }
 
@@ -175,7 +196,7 @@ async function runFusion(o, rawPrompt) {
 }
 
 async function runCheck(o) {
-  await checkSlugs([...o.proposers, ...SAFE_PROPOSERS, o.aggregator, AGG_FALLBACK, o.structurer, ...SUGGEST]);
+  await checkSlugs([...o.proposers, ...SAFE_PROPOSERS, ...MAX_PROPOSERS, ...MAX_SAFE_PROPOSERS, o.aggregator, MAX_AGGREGATOR, AGG_FALLBACK, o.structurer, ...SUGGEST]);
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -184,7 +205,8 @@ async function main() {
   const o = parseArgs(process.argv.slice(2));
   if (o.listModels) {
     console.log('Suggested models (slugs):\n' + SUGGEST.map((m) => `  ${m}  (~$${PRICES[m].in}/$${PRICES[m].out} per 1M)`).join('\n')
-      + `\n\nDefault proposers: ${DEFAULT_PROPOSERS.join(', ')}\n--safe proposers: ${SAFE_PROPOSERS.join(', ')}\nAggregator: ${DEFAULT_AGGREGATOR} (fallback ${AGG_FALLBACK})\nStructurer: ${DEFAULT_STRUCTURER}`);
+      + `\n\nDefault proposers: ${DEFAULT_PROPOSERS.join(', ')}\n--safe proposers: ${SAFE_PROPOSERS.join(', ')}\nAggregator: ${DEFAULT_AGGREGATOR} (fallback ${AGG_FALLBACK})\nStructurer: ${DEFAULT_STRUCTURER}`
+      + `\n\n--max proposers: ${MAX_PROPOSERS.join(', ')}\n--max --safe: ${MAX_SAFE_PROPOSERS.join(', ')}\n--max aggregator: ${MAX_AGGREGATOR} (all forced to xhigh effort)`);
     return;
   }
   if (!KEY) { console.error('ERROR: OPENROUTER_API_KEY missing from env.'); process.exit(1); }
